@@ -30,7 +30,7 @@ import {
 	TextDocument
 } from 'vscode-languageserver-textdocument';
 import { parse, stringify } from 'yaml';
-const OPENROUTER_KEY = process.env.OPENROUTER;
+const OPENROUTER_KEY = process.env.OPENROUTER_KEY;
 
 // Create a connection for the server, using Node's IPC as a transport.
 // Also include all preview / proposed LSP features.
@@ -144,118 +144,129 @@ connection.onRequest('llm-feedback.insertComment', async (params: {uri: string, 
 	if(!doc){
 		return {success: false, error: 'Document not found'}
 	}
-	try{
-		const parsedContent = parseYamlContent(params.text)
-		if (!parsedContent) {
-			return { 
-				success: false,
-				error: "failed parsing YAML content"
-			};
-		}
-		connection.console.log("Parsed YAML Content: " + JSON.stringify(parsedContent.parsedContent, null, 2));
 
-		const llmPrompt = `
-				1.Convert the following prompts into a YAML format that uses a pseudo code that you can interpret precisely.
-				2.Evaluate the YAML and write any improvements and extensions.
-				3.Revise the original YAML to include all the improvements and extension you suggested with comments.
-				4.Extract all the keywords used in the YAML specification and list them, explaining how each is to be used.
-				Return prompt 3 and 4 only. Prompt 4 should have the keywords in json format, keywords{word:,explanation:}
-				`.trim();
-				// Not using the above, but leaving it here for future.
-				//Key words should soon be returned as well, probably in a list or tuple format. These can be used to to replace the existing ones
-		let contentForLLM;
-		if (parsedContent.isCorrection) {
-			contentForLLM = `
-			Please correct the following code or syntac:
-			${parsedContent.dataToCorrect}
+	const model = [ "shisa-ai/shisa-v2-llama3.3-70b:free","qwen/qwen3-32b:free", "deepseek/deepseek-chat-v3-0324:free"]
 
-			Return ONLY the corrected code. NOTHING ELSE. 
-			`;
-		} else {
-			contentForLLM = `
-			I have the following YAML text:
-			${params.text}
-			Parsed YAML text here:
-			prompt: ${parsedContent.parsedPrompt}
-			data: ${JSON.stringify(parsedContent.parsedData)}
-			Perform the requested operation from the prompt on the data.
-			Return ONLY the result as a single YAML Comment line, with no explanation, code blocks, or additional formatting.
-			`;
-		}
-		const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-			method: "POST",
-			headers:{
-				"Authorization": "Bearer "+OPENROUTER_KEY,
-				"Content-Type": "application/json"
-			},
-			body: JSON.stringify({
-				"model": "deepseek/deepseek-chat-v3-0324:free", // Model 
-				"models": ["shisa-ai/shisa-v2-llama3.3-70b:free","qwen/qwen3-32b:free"], //Backup models for OpenRouter server
-				"messages": [
-					{
-						"role": "user",
-						"content": contentForLLM // Send prompt and data from YAML
+	const parsedContent = parseYamlContent(params.text)
+	if (!parsedContent) {
+		return { 
+			success: false,
+			error: "failed parsing YAML content"
+		};
+	}
+	connection.console.log("Parsed YAML Content: " + JSON.stringify(parsedContent.parsedContent, null, 2));
+
+	const llmPrompt = `
+			1.Convert the following prompts into a YAML format that uses a pseudo code that you can interpret precisely.
+			2.Evaluate the YAML and write any improvements and extensions.
+			3.Revise the original YAML to include all the improvements and extension you suggested with comments.
+			4.Extract all the keywords used in the YAML specification and list them, explaining how each is to be used.
+			Return prompt 3 and 4 only. Prompt 4 should have the keywords in json format, keywords{word:,explanation:}
+			`.trim();
+			// Not using the above, but leaving it here for future.
+			//Key words should soon be returned as well, probably in a list or tuple format. These can be used to to replace the existing ones
+	let contentForLLM;
+	if (parsedContent.isCorrection) {
+		contentForLLM = `
+		Please correct the following code or syntac:
+		${parsedContent.dataToCorrect}
+		Return ONLY the corrected code. NOTHING ELSE. 
+		`;
+	} else {
+		contentForLLM = `
+		I have the following YAML text:
+		${params.text}
+		Parsed YAML text here:
+		prompt: ${parsedContent.parsedPrompt}
+		data: ${JSON.stringify(parsedContent.parsedData)}
+		Perform the requested operation from the prompt on the data.
+		Return ONLY the result as a single YAML Comment line, with no explanation, code blocks, or additional formatting.
+		`;
+	}
+	let errorMessage = "";
+	let suggestion = "";
+
+	for (const modelName of model){
+		try{
+			const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+				method: "POST",
+				headers:{
+					"Authorization": "Bearer "+OPENROUTER_KEY,
+					"Content-Type": "application/json"
+				},
+				body: JSON.stringify({
+					"model": modelName, // Model 
+					"messages": [
+						{
+							"role": "user",
+							"content": contentForLLM // Send prompt and data from YAML
+						}
+					]
+				})
+			});
+			//hanlde error here
+			if (!response.ok){
+				const error = await response.json() as {error:{ message: string, code: string}};
+				console.log(error)
+				throw new LLMError(error.error.code, error.error.message);
+			}
+			interface OpenAIResponse {
+				choices: {
+					message?: {
+						role: string;
+						content: string;
+					};
+					error?: {
+						message: string;
+						code: string;
+					};
+				}[];
+			}
+			const result = await response.json() as OpenAIResponse;
+			if (result.choices[0].error) {
+				const error = result.choices[0].error;
+				throw new LLMError(error.code, error.message);
+			}
+			console.log(result);
+			connection.console.log("LLM Prompt:" + contentForLLM);
+			connection.console.log("LLM Response:"+ JSON.stringify(result, null, 2)); 
+			const feedback = result.choices[0]?.message?.content ?? '';
+			logResponseToFile(params.text, result);
+			if (parsedContent.isCorrection && parsedContent.shouldReplace) {
+				return {
+					success: true,
+					replaceSelection: true,
+					replacement: feedback
+				};
+			} else {
+				const cleanFeedback = feedback.replace(/\n/g, ' ').trim();
+				return {
+					success: true,
+					comment: cleanFeedback,
+					position:{
+						line: params.range.start.line +1,
+						character:0
 					}
-				]
-			})
-		});
-
-		//hanlde error here
-		if (!response.ok){
-			const error = await response.json() as {error:{ message: string, code: string}};
-			console.log(error)
-			throw new LLMError(error.error.code, error.error.message);
-		}
-
-		interface OpenAIResponse {
-			choices: {
-				message?: {
-					role: string;
-					content: string;
 				};
-				error?: {
-					message: string;
-					code: string;
-				};
-			}[];
-		}
-		const result = await response.json() as OpenAIResponse;
-		if (result.choices[0].error) {
-			const error = result.choices[0].error;
-			throw new LLMError(error.code, error.message);
-		}
-		console.log(result);
-		connection.console.log("LLM Prompt:" + contentForLLM);
-		connection.console.log("LLM Response:"+ JSON.stringify(result, null, 2)); 
-		const feedback = result.choices[0]?.message?.content ?? '';
-		logResponseToFile(params.text, result);
-		if (parsedContent.isCorrection && parsedContent.shouldReplace) {
-			return {
-				success: true,
-				replaceSelection: true,
-				replacement: feedback
-			};
-		} else {
-			const cleanFeedback = feedback.replace(/\n/g, ' ').trim();
-			return {
-				success: true,
-				comment: cleanFeedback,
-				position:{
-					line: params.range.start.line +1,
-					character:0
+			}
+		} catch (error) {
+			if (error instanceof LLMError){
+				errorMessage = error.message;
+				logErrorToFile(params.text, error)
+				suggestion = handleLLMError(error);
+				console.log("Error: " + errorMessage);
+				if (errorMessage === 'switch') {
+					connection.console.log("Switching model due to error: " + error.code);
+					continue; // Try the next model
+				} else {
+					notifyClientError(errorMessage);
+					notifyClientError(suggestion)
+					return {success: false, error: errorMessage}
 				}
-			};
-		}
-		
-	} catch (error) {
-		if (error instanceof LLMError){
-			logErrorToFile(params.text, error)
-			const errorMessage = handleLLMError(error);
-			notifyClientError(errorMessage);
-			notifyClientError(error.message)
-			return {success: false, error: errorMessage}
+			}
 		}
 	}
+	
 })
 
 connection.onRequest('llm-schema.extractKeywords', async (params: { schema: any, yamlText?: string }) => {

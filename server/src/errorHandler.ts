@@ -18,6 +18,9 @@ const LLM_ERRORS_SUGGESTIONS: Record<string, string> = {
 }
 
 export function handleLLMError(error: LLMError): string {
+  if (error.code === '502' || error.code === '503') {
+     return 'switch';
+  }
 	const suggestion = LLM_ERRORS_SUGGESTIONS[error.code] || "Please check the server logs for more details.";
 	return `Suggestion: ${suggestion}`;
 }
